@@ -13,8 +13,10 @@ jobs:
         shell: pwsh
         run: |
           git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
-          C:\vcpkg\bootstrap-vcpkg.bat
-          C:\vcpkg\vcpkg.exe install boost-asio boost-iostreams boost-system boost-filesystem boost-variant2 boost-lockfree luajit libmariadb pugixml cryptopp fmt --triplet x64-windows
+          cd C:\vcpkg
+          git checkout 5568f110b509a9fd90711978a7cb76bae75bb092
+          .\bootstrap-vcpkg.bat
+          .\vcpkg.exe install boost-asio boost-iostreams boost-system boost-filesystem boost-variant boost-lockfree boost-date-time boost-regex boost-thread luajit libmariadb pugixml cryptopp fmt --triplet x64-windows
 
       - name: Configure
         run: cmake -B build -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake -DCMAKE_BUILD_TYPE=Release -A x64
