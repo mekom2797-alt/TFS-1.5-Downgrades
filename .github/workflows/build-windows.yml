@@ -12,14 +12,15 @@ jobs:
       - name: Install vcpkg packages
         shell: pwsh
         run: |
-          git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
-          cd C:\vcpkg
+          git clone https://github.com/microsoft/vcpkg.git D:\vcpkg-old
+          cd D:\vcpkg-old
           git checkout 5568f110b509a9fd90711978a7cb76bae75bb092
+          git log -1 --oneline
           .\bootstrap-vcpkg.bat
           .\vcpkg.exe install boost-asio boost-iostreams boost-system boost-filesystem boost-variant boost-lockfree boost-date-time boost-regex boost-thread luajit libmariadb pugixml cryptopp fmt --triplet x64-windows
 
       - name: Configure
-        run: cmake -B build -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake -DCMAKE_BUILD_TYPE=Release -A x64
+        run: cmake -B build -DCMAKE_TOOLCHAIN_FILE=D:/vcpkg-old/scripts/buildsystems/vcpkg.cmake -DCMAKE_BUILD_TYPE=Release -A x64
 
       - name: Build
         run: cmake --build build --config Release
