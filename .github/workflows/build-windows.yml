@@ -1,0 +1,37 @@
+name: Build Windows
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install vcpkg packages
+        shell: pwsh
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
+          C:\vcpkg\bootstrap-vcpkg.bat
+          C:\vcpkg\vcpkg.exe install boost-asio boost-iostreams boost-system boost-filesystem boost-variant2 boost-lockfree luajit libmariadb pugixml cryptopp fmt --triplet x64-windows
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake -DCMAKE_BUILD_TYPE=Release -A x64
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Collect files
+        shell: pwsh
+        run: |
+          mkdir out
+          Copy-Item build\Release\*.exe out\
+          Copy-Item build\Release\*.dll out\ -ErrorAction SilentlyContinue
+          Copy-Item data out\data -Recurse
+          Copy-Item config.lua.dist, key.pem, schema.sql out\
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tfs-860-windows
+          path: out
