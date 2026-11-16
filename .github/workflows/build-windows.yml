@@ -9,7 +9,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Patch source for modern Boost
+      - name: Patch source for modern Boost and fmt
         shell: pwsh
         run: |
           $files = Get-ChildItem src -Recurse -Include *.h,*.cpp
@@ -23,6 +23,8 @@ jobs:
             $t = $t -replace 'boost::asio::ip::address_v4::from_string\(([^)]*)\)', 'boost::asio::ip::make_address_v4($1)'
             $t = $t -replace 'address_v4::from_string\(([^)]*)\)', 'boost::asio::ip::make_address_v4($1)'
             $t = $t -replace '\bio_service\b', 'io_context'
+            $t = $t -replace '\bio_context\.post\((.*)\)\);', 'boost::asio::post(io_context, $1));'
+            $t = $t -replace 'fmt::format\("\{:d\}, \{\}, \{:s\}", house->getId\(\), (GUEST_LIST|SUBOWNER_LIST), ', 'fmt::format("{:d}, {}, {:s}", house->getId(), static_cast<int>($1), '
             if ($t -ne $o) { Set-Content -Path $f.FullName -Value $t -NoNewline; Write-Host "patched $($f.Name)" }
           }
 
@@ -49,7 +51,10 @@ jobs:
           cmake -B build -DCMAKE_TOOLCHAIN_FILE="$vc/scripts/buildsystems/vcpkg.cmake" -DCMAKE_BUILD_TYPE=Release -A x64
 
       - name: Build
-        run: cmake --build build --config Release 2>&1 | Tee-Object -FilePath build.log
+        shell: pwsh
+        run: |
+          cmake --build build --config Release 2>&1 | Tee-Object -FilePath build.log
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Show errors
         if: failure()
