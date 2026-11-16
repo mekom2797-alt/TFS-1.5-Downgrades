@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
 
 env:
-  VCPKG_TAG: "2023.12.12"
   TRIPLET: x64-windows
+  VCPKG_BASELINE_TAG: "2023.12.12"
   VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\.vcpkg-cache
 
 jobs:
@@ -14,74 +14,106 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache vcpkg binaries
-        uses: actions/cache@v4
+      # مفتاح ثابت: ما يتغيرش لما تعدّل الـ workflow
+      - name: Restore vcpkg cache
+        id: deps-cache
+        uses: actions/cache/restore@v4
         with:
-          path: .vcpkg-cache
-          key: vcpkg-bin-${{ env.VCPKG_TAG }}-${{ hashFiles('.github/workflows/**') }}
-          restore-keys: vcpkg-bin-${{ env.VCPKG_TAG }}-
+          path: |
+            .vcpkg-cache
+            vcpkg_installed
+          key: deps-${{ env.VCPKG_BASELINE_TAG }}-v1
 
-      - name: Setup pinned vcpkg
+      - name: Restore build cache (incremental)
+        uses: actions/cache/restore@v4
+        with:
+          path: build
+          key: build-v1-${{ github.run_id }}
+          restore-keys: build-v1-
+
+      - name: Setup vcpkg (runner built-in + old baseline)
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path .vcpkg-cache | Out-Null
-          $dir = Join-Path $env:RUNNER_TEMP 'vcpkg'
-          git clone --depth 1 --branch $env:VCPKG_TAG https://github.com/microsoft/vcpkg.git $dir
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          & "$dir\bootstrap-vcpkg.bat" -disableMetrics
-          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $dir = $env:VCPKG_INSTALLATION_ROOT
+          git -C $dir fetch --tags --unshallow 2>&1 | Out-Null
+          git -C $dir fetch --tags 2>&1 | Out-Null
+          $sha = (git -C $dir rev-parse "$($env:VCPKG_BASELINE_TAG)^{commit}" 2>$null)
+          if (-not $sha) { Write-Host "baseline tag not found"; exit 1 }
           Add-Content -Path $env:GITHUB_ENV -Value "VCPKG_ROOT=$dir"
+          Add-Content -Path $env:GITHUB_ENV -Value "VCPKG_BASELINE=$($sha.Trim())"
 
       - name: Write vcpkg manifest
         shell: pwsh
         run: |
-          $json = @'
+          $json = @"
           {
             "name": "tfs",
             "version": "1.0.0",
+            "builtin-baseline": "$env:VCPKG_BASELINE",
             "dependencies": [
               "boost-asio", "boost-iostreams", "boost-system", "boost-filesystem",
               "boost-variant", "boost-lockfree", "boost-date-time", "boost-regex",
               "boost-thread", "luajit", "libmariadb", "pugixml", "cryptopp", "fmt"
             ]
           }
-          '@
+          "@
           Set-Content -Path vcpkg.json -Value $json -Encoding utf8
 
-      - name: Install dependencies
+      - name: Install dependencies (with retry)
+        id: install
         shell: pwsh
         run: |
-          & "$env:VCPKG_ROOT\vcpkg.exe" install --triplet $env:TRIPLET --x-install-root=vcpkg_installed --disable-metrics 2>&1 | Tee-Object -FilePath vcpkg.log
-          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $ok = $false
+          foreach ($i in 1..3) {
+            Write-Host "vcpkg install attempt $i"
+            & "$env:VCPKG_ROOT\vcpkg.exe" install --triplet $env:TRIPLET --x-install-root=vcpkg_installed --disable-metrics 2>&1 | Tee-Object -FilePath vcpkg.log -Append
+            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+            Start-Sleep -Seconds 10
+          }
+          if (-not $ok) { exit 1 }
+
+      # يحفظ المكتبات حتى لو البناء فشل بعد كده
+      - name: Save vcpkg cache
+        if: always() && steps.install.outcome == 'success' && steps.deps-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .vcpkg-cache
+            vcpkg_installed
+          key: deps-${{ env.VCPKG_BASELINE_TAG }}-v1
 
       - name: Patch source (fmt enums + CryptoPP target)
         shell: pwsh
         run: |
-          # fmt: enums must be cast to int
           foreach ($f in Get-ChildItem src -Recurse -Include *.h,*.cpp) {
             $t = Get-Content $f.FullName -Raw
             $o = $t
             $t = $t -replace 'fmt::format\("\{:d\}, \{\}, \{:s\}", house->getId\(\), (GUEST_LIST|SUBOWNER_LIST), ', 'fmt::format("{:d}, {}, {:s}", house->getId(), static_cast<int>($1), '
             if ($t -ne $o) { Set-Content -Path $f.FullName -Value $t -NoNewline; Write-Host "patched $($f.Name)" }
           }
-          # CryptoPP: support both target names
           $cm = Get-Content CMakeLists.txt -Raw
-          $new = 'if(TARGET cryptopp::cryptopp)' + "`n" + '  set(Crypto++_LIBRARIES cryptopp::cryptopp)' + "`n" + 'else()' + "`n" + '  set(Crypto++_LIBRARIES "cryptopp-static")' + "`n" + 'endif()'
-          $cm2 = $cm -replace 'set\(Crypto\+\+_LIBRARIES "cryptopp-static"\)', $new
-          if ($cm2 -ne $cm) { Set-Content -Path CMakeLists.txt -Value $cm2 -NoNewline; Write-Host "patched CMakeLists.txt" }
+          if ($cm -notmatch 'TARGET cryptopp::cryptopp') {
+            $new = "if(TARGET cryptopp::cryptopp)`n  set(Crypto++_LIBRARIES cryptopp::cryptopp)`nelseif(TARGET cryptopp-shared)`n  set(Crypto++_LIBRARIES cryptopp-shared)`nelse()`n  set(Crypto++_LIBRARIES cryptopp-static)`nendif()"
+            $cm2 = $cm -replace 'set\(Crypto\+\+_LIBRARIES "cryptopp-static"\)', $new.Replace('$','$$')
+            if ($cm2 -ne $cm) { Set-Content -Path CMakeLists.txt -Value $cm2 -NoNewline; Write-Host "patched CMakeLists.txt" }
+          }
 
       - name: Configure
         shell: pwsh
         run: |
           $root = (Resolve-Path "vcpkg_installed\$env:TRIPLET").Path
-          $luaLib = Get-ChildItem "$root\lib" -Filter 'lua*.lib' | Select-Object -First 1
+          $luaLib = Get-ChildItem "$root\lib" -Recurse -Filter 'lua*.lib' | Select-Object -First 1
           $luaInc = Get-ChildItem "$root\include" -Recurse -Filter luajit.h | Select-Object -First 1
-          $myLib  = Get-ChildItem "$root\lib" -Filter 'libmariadb*.lib' | Select-Object -First 1
+          $myLib  = Get-ChildItem "$root\lib" -Recurse -Filter '*mariadb*.lib' | Select-Object -First 1
           $myInc  = Get-ChildItem "$root\include" -Recurse -Filter mysql.h | Select-Object -First 1
           "luajit lib : $($luaLib.FullName)"
-          "luajit inc : $($luaInc.DirectoryName)"
           "mysql  lib : $($myLib.FullName)"
-          "mysql  inc : $($myInc.DirectoryName)"
+          if (-not ($luaLib -and $luaInc -and $myLib -and $myInc)) {
+            Write-Host "ERROR: could not locate luajit or mariadb files"
+            Get-ChildItem "$root\lib" -Recurse -Filter *.lib | Select-Object -ExpandProperty FullName
+            exit 1
+          }
           $ll = $luaLib.FullName.Replace('\','/');  $li = $luaInc.DirectoryName.Replace('\','/')
           $ml = $myLib.FullName.Replace('\','/');   $mi = $myInc.DirectoryName.Replace('\','/')
           $tc = "$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake".Replace('\','/')
@@ -92,29 +124,85 @@ jobs:
             -DVCPKG_INSTALLED_DIR="$inst" `
             -DVCPKG_MANIFEST_INSTALL=OFF `
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5 `
-            -DCMAKE_BUILD_TYPE=Release `
             -DLUAJIT_INCLUDE_DIR="$li" -DLUAJIT_LIBRARY="$ll" -DLUAJIT_LIBRARIES="$ll" `
             -DMYSQL_INCLUDE_DIR="$mi" -DMYSQL_LIBRARY="$ml" -DMYSQL_LIBRARIES="$ml" `
             -DMySQL_INCLUDE_DIR="$mi" -DMySQL_LIBRARY="$ml" -DMySQL_LIBRARIES="$ml" `
             2>&1 | Tee-Object -FilePath configure.log
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
-      - name: Build
+      - name: Build (auto-fix known errors, up to 3 attempts)
+        id: build
         shell: pwsh
         run: |
-          cmake --build build --config Release --parallel 2>&1 | Tee-Object -FilePath build.log
-          if ($LASTEXITCODE -ne 0) { exit 1 }
+          function Fix-Source([string]$pattern, [string]$replacement) {
+            $count = 0
+            foreach ($f in Get-ChildItem src -Recurse -Include *.h,*.cpp) {
+              $t = Get-Content $f.FullName -Raw
+              $n = $t -replace $pattern, $replacement
+              if ($n -ne $t) { Set-Content -Path $f.FullName -Value $n -NoNewline; Write-Host "auto-fixed $($f.Name)"; $count++ }
+            }
+            return $count
+          }
+
+          $success = $false
+          foreach ($attempt in 1..3) {
+            Write-Host "=== build attempt $attempt ==="
+            cmake --build build --config Release --parallel 2>&1 | Tee-Object -FilePath build.log
+            if ($LASTEXITCODE -eq 0) { $success = $true; break }
+
+            $log = Get-Content build.log -Raw
+            $changed = 0
+            if ($log -match 'io_service') {
+              $changed += Fix-Source 'boost::asio::io_service' 'boost::asio::io_context'
+              $changed += Fix-Source '\bio_service\b' 'io_context'
+              $changed += Fix-Source 'io_context::work\b' 'io_context::work'
+            }
+            if ($log -match 'expires_from_now') {
+              $changed += Fix-Source '\.expires_from_now\(' '.expires_after('
+            }
+            if ($log -match 'from_string') {
+              $changed += Fix-Source '(boost::asio::ip::)?address_v4::from_string\(([^)]*)\)' 'boost::asio::ip::make_address_v4($2)'
+            }
+            if ($log -match 'fmt' -and $log -match 'GUEST_LIST|SUBOWNER_LIST') {
+              $changed += Fix-Source '(house->getId\(\), )(GUEST_LIST|SUBOWNER_LIST)(, )' '$1static_cast<int>($2)$3'
+            }
+            if ($changed -eq 0) { Write-Host "no known fix matched, stopping"; break }
+          }
+          if (-not $success) { exit 1 }
+
+      - name: Save build cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: build
+          key: build-v1-${{ github.run_id }}
 
       - name: Show errors
         if: failure()
         shell: pwsh
         run: |
+          $summary = @()
           foreach ($f in 'vcpkg.log','configure.log','build.log') {
             if (Test-Path $f) {
-              "=== $f ==="
-              Select-String -Path $f -Pattern 'error C\d+|error LNK\d+|CMake Error|fatal error|Could NOT|not found' |
-                Select-Object -First 60 | ForEach-Object { $_.Line }
-            } else { "$f not found" }
+              $summary += "=== $f (errors) ==="
+              $summary += Select-String -Path $f -Pattern 'error C\d+|error LNK\d+|CMake Error|fatal error|Could NOT|not found|error:' |
+                Select-Object -Last 40 | ForEach-Object { $_.Line }
+            } else { $summary += "$f not found" }
+          }
+          $summary
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+
+      - name: Collect vcpkg internal logs
+        if: failure()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path vcpkg-logs | Out-Null
+          $bt = Join-Path $env:VCPKG_ROOT 'buildtrees'
+          if (Test-Path $bt) {
+            Get-ChildItem $bt -Recurse -Filter *.log -ErrorAction SilentlyContinue |
+              Select-Object -First 60 | ForEach-Object {
+                Copy-Item $_.FullName (Join-Path vcpkg-logs ($_.Directory.Name + '-' + $_.Name)) -ErrorAction SilentlyContinue
+              }
           }
 
       - name: Collect files
@@ -124,10 +212,7 @@ jobs:
           Get-ChildItem build -Recurse -Filter *.exe |
             Where-Object { $_.FullName -notmatch 'CMakeFiles' } |
             Copy-Item -Destination out
-          Get-ChildItem build\Release -Filter *.dll -ErrorAction SilentlyContinue | Copy-Item -Destination out
-          if (-not (Test-Path out\*.dll)) {
-            Get-ChildItem "vcpkg_installed\$env:TRIPLET\bin" -Filter *.dll -ErrorAction SilentlyContinue | Copy-Item -Destination out
-          }
+          Get-ChildItem "vcpkg_installed\$env:TRIPLET\bin" -Filter *.dll -ErrorAction SilentlyContinue | Copy-Item -Destination out -ErrorAction SilentlyContinue
           if (Test-Path data) { Copy-Item data out\data -Recurse }
           foreach ($f in 'config.lua.dist','key.pem','schema.sql') {
             if (Test-Path $f) { Copy-Item $f out\ }
@@ -147,4 +232,5 @@ jobs:
             vcpkg.log
             configure.log
             build.log
+            vcpkg-logs
           if-no-files-found: ignore
