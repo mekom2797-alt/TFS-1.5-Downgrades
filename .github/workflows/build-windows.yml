@@ -4,9 +4,11 @@ on:
   workflow_dispatch:
 
 env:
-  TRIPLET: x64-windows
+  TRIPLET: x64-windows-cm4
   VCPKG_BASELINE_TAG: "2023.12.12"
   VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\.vcpkg-cache
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  VCPKG_KEEP_ENV_VARS: "CMAKE_POLICY_VERSION_MINIMUM"
 
 jobs:
   windows:
@@ -14,7 +16,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # مفتاح ثابت: ما يتغيرش لما تعدّل الـ workflow
       - name: Restore vcpkg cache
         id: deps-cache
         uses: actions/cache/restore@v4
@@ -22,14 +23,14 @@ jobs:
           path: |
             .vcpkg-cache
             vcpkg_installed
-          key: deps-${{ env.VCPKG_BASELINE_TAG }}-v1
+          key: deps-${{ env.VCPKG_BASELINE_TAG }}-v2
 
       - name: Restore build cache (incremental)
         uses: actions/cache/restore@v4
         with:
           path: build
-          key: build-v1-${{ github.run_id }}
-          restore-keys: build-v1-
+          key: build-v2-${{ github.run_id }}
+          restore-keys: build-v2-
 
       - name: Setup vcpkg (runner built-in + old baseline)
         shell: pwsh
@@ -42,6 +43,19 @@ jobs:
           if (-not $sha) { Write-Host "baseline tag not found"; exit 1 }
           Add-Content -Path $env:GITHUB_ENV -Value "VCPKG_ROOT=$dir"
           Add-Content -Path $env:GITHUB_ENV -Value "VCPKG_BASELINE=$($sha.Trim())"
+
+      - name: Custom triplet (CMake 4 compat)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path triplets | Out-Null
+          $t = @(
+            'set(VCPKG_TARGET_ARCHITECTURE x64)',
+            'set(VCPKG_CRT_LINKAGE dynamic)',
+            'set(VCPKG_LIBRARY_LINKAGE dynamic)',
+            'list(APPEND VCPKG_CMAKE_CONFIGURE_OPTIONS "-DCMAKE_POLICY_VERSION_MINIMUM=3.5")'
+          )
+          $t | Set-Content -Path triplets\x64-windows-cm4.cmake -Encoding ascii
+          Get-Content triplets\x64-windows-cm4.cmake
 
       - name: Write vcpkg manifest
         shell: pwsh
@@ -65,15 +79,14 @@ jobs:
         shell: pwsh
         run: |
           $ok = $false
-          foreach ($i in 1..3) {
+          foreach ($i in 1..2) {
             Write-Host "vcpkg install attempt $i"
-            & "$env:VCPKG_ROOT\vcpkg.exe" install --triplet $env:TRIPLET --x-install-root=vcpkg_installed --disable-metrics 2>&1 | Tee-Object -FilePath vcpkg.log -Append
+            & "$env:VCPKG_ROOT\vcpkg.exe" install --triplet $env:TRIPLET --overlay-triplets=triplets --x-install-root=vcpkg_installed --disable-metrics 2>&1 | Tee-Object -FilePath vcpkg.log -Append
             if ($LASTEXITCODE -eq 0) { $ok = $true; break }
             Start-Sleep -Seconds 10
           }
           if (-not $ok) { exit 1 }
 
-      # يحفظ المكتبات حتى لو البناء فشل بعد كده
       - name: Save vcpkg cache
         if: always() && steps.install.outcome == 'success' && steps.deps-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
@@ -81,7 +94,7 @@ jobs:
           path: |
             .vcpkg-cache
             vcpkg_installed
-          key: deps-${{ env.VCPKG_BASELINE_TAG }}-v1
+          key: deps-${{ env.VCPKG_BASELINE_TAG }}-v2
 
       - name: Patch source (fmt enums + CryptoPP target)
         shell: pwsh
@@ -118,9 +131,11 @@ jobs:
           $ml = $myLib.FullName.Replace('\','/');   $mi = $myInc.DirectoryName.Replace('\','/')
           $tc = "$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake".Replace('\','/')
           $inst = $root.Replace('\','/') -replace '/[^/]+$',''
+          $ov = (Resolve-Path triplets).Path.Replace('\','/')
           cmake -B build -A x64 `
             -DCMAKE_TOOLCHAIN_FILE="$tc" `
             -DVCPKG_TARGET_TRIPLET="$env:TRIPLET" `
+            -DVCPKG_OVERLAY_TRIPLETS="$ov" `
             -DVCPKG_INSTALLED_DIR="$inst" `
             -DVCPKG_MANIFEST_INSTALL=OFF `
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5 `
@@ -155,7 +170,6 @@ jobs:
             if ($log -match 'io_service') {
               $changed += Fix-Source 'boost::asio::io_service' 'boost::asio::io_context'
               $changed += Fix-Source '\bio_service\b' 'io_context'
-              $changed += Fix-Source 'io_context::work\b' 'io_context::work'
             }
             if ($log -match 'expires_from_now') {
               $changed += Fix-Source '\.expires_from_now\(' '.expires_after('
@@ -170,12 +184,32 @@ jobs:
           }
           if (-not $success) { exit 1 }
 
-      - name: Save build cache
+      - name: Check build dir
+        id: bdir
         if: always()
+        shell: pwsh
+        run: |
+          "exists=$((Test-Path build).ToString().ToLower())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Save build cache
+        if: always() && steps.bdir.outputs.exists == 'true'
         uses: actions/cache/save@v4
         with:
           path: build
-          key: build-v1-${{ github.run_id }}
+          key: build-v2-${{ github.run_id }}
+
+      - name: Collect vcpkg internal logs
+        if: failure()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path vcpkg-logs | Out-Null
+          $bt = Join-Path $env:VCPKG_ROOT 'buildtrees'
+          if (Test-Path $bt) {
+            Get-ChildItem $bt -Recurse -Include '*-out.log','*-err.log','config-*.log' -ErrorAction SilentlyContinue |
+              ForEach-Object {
+                Copy-Item $_.FullName (Join-Path vcpkg-logs ($_.Directory.Name + '-' + $_.Name)) -ErrorAction SilentlyContinue
+              }
+          }
 
       - name: Show errors
         if: failure()
@@ -189,21 +223,14 @@ jobs:
                 Select-Object -Last 40 | ForEach-Object { $_.Line }
             } else { $summary += "$f not found" }
           }
+          if (Test-Path vcpkg-logs) {
+            Get-ChildItem vcpkg-logs -Filter '*-out.log' | ForEach-Object {
+              $summary += "=== vcpkg internal: $($_.Name) (last 40 lines) ==="
+              $summary += Get-Content $_.FullName -Tail 40
+            }
+          }
           $summary
           $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8
-
-      - name: Collect vcpkg internal logs
-        if: failure()
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path vcpkg-logs | Out-Null
-          $bt = Join-Path $env:VCPKG_ROOT 'buildtrees'
-          if (Test-Path $bt) {
-            Get-ChildItem $bt -Recurse -Filter *.log -ErrorAction SilentlyContinue |
-              Select-Object -First 60 | ForEach-Object {
-                Copy-Item $_.FullName (Join-Path vcpkg-logs ($_.Directory.Name + '-' + $_.Name)) -ErrorAction SilentlyContinue
-              }
-          }
 
       - name: Collect files
         shell: pwsh
