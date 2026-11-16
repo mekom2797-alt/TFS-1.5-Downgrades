@@ -12,6 +12,13 @@ jobs:
       - name: Write vcpkg manifest
         shell: pwsh
         run: |
+          New-Item -ItemType Directory -Path triplets -Force | Out-Null
+          Set-Content -Path triplets\x64-windows-release.cmake -Value @"
+          set(VCPKG_TARGET_ARCHITECTURE x64)
+          set(VCPKG_CRT_LINKAGE dynamic)
+          set(VCPKG_LIBRARY_LINKAGE dynamic)
+          set(VCPKG_BUILD_TYPE release)
+          "@
           $json = @'
           {
             "name": "tfs",
@@ -47,7 +54,7 @@ jobs:
           $j = Get-Content vcpkg.json -Raw | ConvertFrom-Json
           $j | Add-Member -NotePropertyName "builtin-baseline" -NotePropertyValue $base
           $j | ConvertTo-Json -Depth 10 | Set-Content vcpkg.json -Encoding utf8
-          cmake -B build -DCMAKE_TOOLCHAIN_FILE="$vc/scripts/buildsystems/vcpkg.cmake" -DCMAKE_BUILD_TYPE=Release -A x64
+          cmake -B build -DCMAKE_TOOLCHAIN_FILE="$vc/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows-release -DVCPKG_OVERLAY_TRIPLETS="$PWD\triplets" -DCMAKE_BUILD_TYPE=Release -A x64
 
       - name: Build
         run: cmake --build build --config Release
