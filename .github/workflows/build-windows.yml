@@ -25,7 +25,7 @@ jobs:
             $t = $t -replace '\bio_service\b', 'io_context'
             $t = $t -replace '\bio_context\.post\((.*)\)\);', 'boost::asio::post(io_context, $1));'
             $t = $t -replace 'fmt::format\("\{:d\}, \{\}, \{:s\}", house->getId\(\), (GUEST_LIST|SUBOWNER_LIST), ', 'fmt::format("{:d}, {}, {:s}", house->getId(), static_cast<int>($1), '
-            $t = $t -replace '\.to_ulong\(\)', '.to_uint()'
+            if ($f.Name -eq 'connection.cpp') { $t = $t -replace '\.to_ulong\(\)', '.to_uint()' }
             if ($t -ne $o) { Set-Content -Path $f.FullName -Value $t -NoNewline; Write-Host "patched $($f.Name)" }
           }
 
