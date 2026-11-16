@@ -9,18 +9,45 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install vcpkg packages
+      - name: Write vcpkg manifest
         shell: pwsh
         run: |
-          git clone https://github.com/microsoft/vcpkg.git D:\vcpkg-old
-          cd D:\vcpkg-old
-          git checkout 5568f110b509a9fd90711978a7cb76bae75bb092
-          git log -1 --oneline
-          .\bootstrap-vcpkg.bat
-          .\vcpkg.exe install boost-asio boost-iostreams boost-system boost-filesystem boost-variant boost-lockfree boost-date-time boost-regex boost-thread luajit libmariadb pugixml cryptopp fmt --triplet x64-windows
+          $json = @'
+          {
+            "name": "tfs",
+            "version": "1.0.0",
+            "dependencies": [
+              "boost-asio", "boost-iostreams", "boost-system", "boost-filesystem",
+              "boost-variant", "boost-lockfree", "boost-date-time", "boost-regex",
+              "boost-thread", "luajit", "libmariadb", "pugixml", "cryptopp", "fmt"
+            ],
+            "overrides": [
+              { "name": "boost-asio", "version": "1.83.0" },
+              { "name": "boost-config", "version": "1.83.0" },
+              { "name": "boost-system", "version": "1.83.0" },
+              { "name": "boost-filesystem", "version": "1.83.0" },
+              { "name": "boost-iostreams", "version": "1.83.0" },
+              { "name": "boost-variant", "version": "1.83.0" },
+              { "name": "boost-lockfree", "version": "1.83.0" },
+              { "name": "boost-date-time", "version": "1.83.0" },
+              { "name": "boost-regex", "version": "1.83.0" },
+              { "name": "boost-thread", "version": "1.83.0" }
+            ]
+          }
+          '@
+          Set-Content -Path vcpkg.json -Value $json -Encoding utf8
 
       - name: Configure
-        run: cmake -B build -DCMAKE_TOOLCHAIN_FILE=D:/vcpkg-old/scripts/buildsystems/vcpkg.cmake -DCMAKE_BUILD_TYPE=Release -A x64
+        shell: pwsh
+        run: |
+          $vc = $env:VCPKG_INSTALLATION_ROOT
+          git -C $vc fetch --unshallow 2>$null
+          $base = git -C $vc rev-list -n 1 --before="2024-01-15" origin/master
+          Write-Host "baseline: $base"
+          $j = Get-Content vcpkg.json -Raw | ConvertFrom-Json
+          $j | Add-Member -NotePropertyName "builtin-baseline" -NotePropertyValue $base
+          $j | ConvertTo-Json -Depth 10 | Set-Content vcpkg.json -Encoding utf8
+          cmake -B build -DCMAKE_TOOLCHAIN_FILE="$vc/scripts/buildsystems/vcpkg.cmake" -DCMAKE_BUILD_TYPE=Release -A x64
 
       - name: Build
         run: cmake --build build --config Release
