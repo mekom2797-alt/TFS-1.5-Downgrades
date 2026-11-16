@@ -3,31 +3,34 @@ name: Build Windows
 on:
   workflow_dispatch:
 
+env:
+  VCPKG_TAG: "2023.12.12"
+  TRIPLET: x64-windows
+  VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\.vcpkg-cache
+
 jobs:
   windows:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
 
-      - name: Patch source for modern Boost and fmt
+      - name: Cache vcpkg binaries
+        uses: actions/cache@v4
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-bin-${{ env.VCPKG_TAG }}-${{ hashFiles('.github/workflows/**') }}
+          restore-keys: vcpkg-bin-${{ env.VCPKG_TAG }}-
+
+      - name: Setup pinned vcpkg
         shell: pwsh
         run: |
-          $files = Get-ChildItem src -Recurse -Include *.h,*.cpp
-          foreach ($f in $files) {
-            $t = Get-Content $f.FullName -Raw
-            $o = $t
-            $t = $t -replace 'boost::asio::io_context::work\s+work\{io_context\};', 'boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work{io_context.get_executor()};'
-            $t = $t -replace 'boost::asio::io_service', 'boost::asio::io_context'
-            $t = $t -replace 'io_service::work', 'io_context::work'
-            $t = $t -replace '\.expires_from_now\(', '.expires_after('
-            $t = $t -replace 'boost::asio::ip::address_v4::from_string\(([^)]*)\)', 'boost::asio::ip::make_address_v4($1)'
-            $t = $t -replace 'address_v4::from_string\(([^)]*)\)', 'boost::asio::ip::make_address_v4($1)'
-            $t = $t -replace '\bio_service\b', 'io_context'
-            $t = $t -replace '\bio_context\.post\((.*)\)\);', 'boost::asio::post(io_context, $1));'
-            $t = $t -replace 'fmt::format\("\{:d\}, \{\}, \{:s\}", house->getId\(\), (GUEST_LIST|SUBOWNER_LIST), ', 'fmt::format("{:d}, {}, {:s}", house->getId(), static_cast<int>($1), '
-            if ($f.Name -eq 'connection.cpp') { $t = $t -replace '\.to_ulong\(\)', '.to_uint()' }
-            if ($t -ne $o) { Set-Content -Path $f.FullName -Value $t -NoNewline; Write-Host "patched $($f.Name)" }
-          }
+          New-Item -ItemType Directory -Force -Path .vcpkg-cache | Out-Null
+          $dir = Join-Path $env:RUNNER_TEMP 'vcpkg'
+          git clone --depth 1 --branch $env:VCPKG_TAG https://github.com/microsoft/vcpkg.git $dir
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          & "$dir\bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Add-Content -Path $env:GITHUB_ENV -Value "VCPKG_ROOT=$dir"
 
       - name: Write vcpkg manifest
         shell: pwsh
@@ -45,33 +48,103 @@ jobs:
           '@
           Set-Content -Path vcpkg.json -Value $json -Encoding utf8
 
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_ROOT\vcpkg.exe" install --triplet $env:TRIPLET --x-install-root=vcpkg_installed --disable-metrics 2>&1 | Tee-Object -FilePath vcpkg.log
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Patch source (fmt enums + CryptoPP target)
+        shell: pwsh
+        run: |
+          # fmt: enums must be cast to int
+          foreach ($f in Get-ChildItem src -Recurse -Include *.h,*.cpp) {
+            $t = Get-Content $f.FullName -Raw
+            $o = $t
+            $t = $t -replace 'fmt::format\("\{:d\}, \{\}, \{:s\}", house->getId\(\), (GUEST_LIST|SUBOWNER_LIST), ', 'fmt::format("{:d}, {}, {:s}", house->getId(), static_cast<int>($1), '
+            if ($t -ne $o) { Set-Content -Path $f.FullName -Value $t -NoNewline; Write-Host "patched $($f.Name)" }
+          }
+          # CryptoPP: support both target names
+          $cm = Get-Content CMakeLists.txt -Raw
+          $new = 'if(TARGET cryptopp::cryptopp)' + "`n" + '  set(Crypto++_LIBRARIES cryptopp::cryptopp)' + "`n" + 'else()' + "`n" + '  set(Crypto++_LIBRARIES "cryptopp-static")' + "`n" + 'endif()'
+          $cm2 = $cm -replace 'set\(Crypto\+\+_LIBRARIES "cryptopp-static"\)', $new
+          if ($cm2 -ne $cm) { Set-Content -Path CMakeLists.txt -Value $cm2 -NoNewline; Write-Host "patched CMakeLists.txt" }
+
       - name: Configure
         shell: pwsh
         run: |
-          $vc = $env:VCPKG_INSTALLATION_ROOT
-          cmake -B build -DCMAKE_TOOLCHAIN_FILE="$vc/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows-static-md -DCMAKE_BUILD_TYPE=Release -A x64
+          $root = (Resolve-Path "vcpkg_installed\$env:TRIPLET").Path
+          $luaLib = Get-ChildItem "$root\lib" -Filter 'lua*.lib' | Select-Object -First 1
+          $luaInc = Get-ChildItem "$root\include" -Recurse -Filter luajit.h | Select-Object -First 1
+          $myLib  = Get-ChildItem "$root\lib" -Filter 'libmariadb*.lib' | Select-Object -First 1
+          $myInc  = Get-ChildItem "$root\include" -Recurse -Filter mysql.h | Select-Object -First 1
+          "luajit lib : $($luaLib.FullName)"
+          "luajit inc : $($luaInc.DirectoryName)"
+          "mysql  lib : $($myLib.FullName)"
+          "mysql  inc : $($myInc.DirectoryName)"
+          $ll = $luaLib.FullName.Replace('\','/');  $li = $luaInc.DirectoryName.Replace('\','/')
+          $ml = $myLib.FullName.Replace('\','/');   $mi = $myInc.DirectoryName.Replace('\','/')
+          $tc = "$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake".Replace('\','/')
+          $inst = $root.Replace('\','/') -replace '/[^/]+$',''
+          cmake -B build -A x64 `
+            -DCMAKE_TOOLCHAIN_FILE="$tc" `
+            -DVCPKG_TARGET_TRIPLET="$env:TRIPLET" `
+            -DVCPKG_INSTALLED_DIR="$inst" `
+            -DVCPKG_MANIFEST_INSTALL=OFF `
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DLUAJIT_INCLUDE_DIR="$li" -DLUAJIT_LIBRARY="$ll" -DLUAJIT_LIBRARIES="$ll" `
+            -DMYSQL_INCLUDE_DIR="$mi" -DMYSQL_LIBRARY="$ml" -DMYSQL_LIBRARIES="$ml" `
+            -DMySQL_INCLUDE_DIR="$mi" -DMySQL_LIBRARY="$ml" -DMySQL_LIBRARIES="$ml" `
+            2>&1 | Tee-Object -FilePath configure.log
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Build
         shell: pwsh
         run: |
-          cmake --build build --config Release 2>&1 | Tee-Object -FilePath build.log
+          cmake --build build --config Release --parallel 2>&1 | Tee-Object -FilePath build.log
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Show errors
         if: failure()
         shell: pwsh
-        run: Select-String -Path build.log -Pattern 'error' | Select-Object -First 40 | ForEach-Object { $_.Line }
+        run: |
+          foreach ($f in 'vcpkg.log','configure.log','build.log') {
+            if (Test-Path $f) {
+              "=== $f ==="
+              Select-String -Path $f -Pattern 'error C\d+|error LNK\d+|CMake Error|fatal error|Could NOT|not found' |
+                Select-Object -First 60 | ForEach-Object { $_.Line }
+            } else { "$f not found" }
+          }
 
       - name: Collect files
         shell: pwsh
         run: |
-          mkdir out
-          Copy-Item build\Release\*.exe out\
-          Copy-Item build\Release\*.dll out\ -ErrorAction SilentlyContinue
-          Copy-Item data out\data -Recurse
-          Copy-Item config.lua.dist, key.pem, schema.sql out\
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Get-ChildItem build -Recurse -Filter *.exe |
+            Where-Object { $_.FullName -notmatch 'CMakeFiles' } |
+            Copy-Item -Destination out
+          Get-ChildItem build\Release -Filter *.dll -ErrorAction SilentlyContinue | Copy-Item -Destination out
+          if (-not (Test-Path out\*.dll)) {
+            Get-ChildItem "vcpkg_installed\$env:TRIPLET\bin" -Filter *.dll -ErrorAction SilentlyContinue | Copy-Item -Destination out
+          }
+          if (Test-Path data) { Copy-Item data out\data -Recurse }
+          foreach ($f in 'config.lua.dist','key.pem','schema.sql') {
+            if (Test-Path $f) { Copy-Item $f out\ }
+          }
+          Get-ChildItem out
 
       - uses: actions/upload-artifact@v4
         with:
           name: tfs-860-windows
           path: out
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs
+          path: |
+            vcpkg.log
+            configure.log
+            build.log
+          if-no-files-found: ignore
