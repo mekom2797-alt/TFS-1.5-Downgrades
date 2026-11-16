@@ -49,7 +49,7 @@ jobs:
         shell: pwsh
         run: |
           $vc = $env:VCPKG_INSTALLATION_ROOT
-          cmake -B build -DCMAKE_TOOLCHAIN_FILE="$vc/scripts/buildsystems/vcpkg.cmake" -DCMAKE_BUILD_TYPE=Release -A x64
+          cmake -B build -DCMAKE_TOOLCHAIN_FILE="$vc/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows-static-md -DCMAKE_BUILD_TYPE=Release -A x64
 
       - name: Build
         shell: pwsh
